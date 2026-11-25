@@ -3,6 +3,8 @@
 A small Windows app that shows your Claude plan usage (the same numbers as
 claude.ai → Settings → Usage) without opening a browser:
 
+![The desktop widget showing current session and weekly usage](docs/screenshot.png)
+
 - **Tray icon** next to the clock with your current session % drawn inside it,
   coloured green / orange / red. Hover for every limit and its reset time.
 - **Desktop widget**: a floating panel with a progress bar per limit
