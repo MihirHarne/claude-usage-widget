@@ -1,0 +1,56 @@
+# Builds the Windows app and publishes it as a GitHub Release.
+# Triggered by pushing a version tag, e.g.:
+#   git tag v0.2.0
+#   git push origin v0.2.0
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # needed to create the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Check the tag matches the app version
+        shell: pwsh
+        run: |
+          $version = python -c "import usage_widget; print(usage_widget.__version__)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            Write-Error "Tag ${{ github.ref_name }} doesn't match usage_widget.__version__ ($version)"
+            exit 1
+          }
+
+      - name: Run tests
+        run: python -m pytest -v
+
+      - name: Build the app
+        run: pyinstaller --noconfirm --noconsole --name ClaudeUsageWidget --icon assets/icon.ico main.py
+
+      - name: Zip the app
+        shell: pwsh
+        run: Compress-Archive -Path dist/ClaudeUsageWidget -DestinationPath "ClaudeUsageWidget-${{ github.ref_name }}-windows.zip"
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          "ClaudeUsageWidget-${{ github.ref_name }}-windows.zip"
+          --title "Claude Usage Widget ${{ github.ref_name }}"
+          --generate-notes

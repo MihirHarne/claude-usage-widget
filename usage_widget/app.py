@@ -1,8 +1,8 @@
-"""Wires the fetcher, tray icon, desktop widget and login window together."""
+"""Wires the fetcher, history, tray icon, widget and windows together."""
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from PySide6.QtCore import QObject, QSettings, QTimer, QUrl
@@ -10,10 +10,13 @@ from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWebEngineCore import QWebEngineProfile
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from . import autostart
-from .config import APP_NAME, ORG_NAME, USAGE_PAGE_URL, Config
+from . import autostart, tray_pin
+from .config import APP_NAME, ORG_NAME, USAGE_PAGE_URL, Config, data_dir
 from .desktop_widget import DesktopWidget
 from .fetcher import UsageFetcher
+from .forecast import Forecast, forecast, window_start
+from .history import HistoryStore
+from .history_window import HistoryWindow
 from .icons import render_icon
 from .login_window import LoginWindow
 from .models import (
@@ -30,6 +33,9 @@ log = logging.getLogger(__name__)
 
 COUNTDOWN_TICK_MS = 30_000
 RETRY_AFTER_FAILURE_MS = 60_000
+# Windows creates the tray icon's settings entry shortly after it first
+# appears, so pinning is tried a few times after start-up.
+PIN_ATTEMPT_DELAYS_MS = (3_000, 15_000, 60_000)
 
 
 class UsageApp(QObject):
@@ -39,9 +45,14 @@ class UsageApp(QObject):
         self._config = config
         self._settings = QSettings(ORG_NAME, APP_NAME)
         self._limits: list[UsageLimit] = []
+        self._forecasts: dict[str, Forecast] = {}
         self._notified_levels: dict[str, str] = {}
         self._login_window: Optional[LoginWindow] = None
+        self._history_window: Optional[HistoryWindow] = None
         self._login_prompted = False
+
+        self._history = HistoryStore(data_dir() / "history.db")
+        self._history.prune(datetime.now(timezone.utc))
 
         # A named profile stores cookies on disk, so you stay signed in.
         self._profile = QWebEngineProfile("claude-usage-widget", self)
@@ -65,6 +76,7 @@ class UsageApp(QObject):
             menu=self._menu,
             settings=self._settings,
             on_refresh=self.refresh,
+            on_history=self._open_history,
             level_of=self._level_of,
         )
         self._widget.setWindowIcon(render_icon(None, None))
@@ -85,6 +97,9 @@ class UsageApp(QObject):
             self._widget.show()
         self._refresh_timer.start()
         self._tick_timer.start()
+        if self._settings.value("pin_tray", True, type=bool):
+            for delay in PIN_ATTEMPT_DELAYS_MS:
+                QTimer.singleShot(delay, self._try_pin_tray)
         self.refresh()
 
     def refresh(self) -> None:
@@ -97,9 +112,11 @@ class UsageApp(QObject):
     def quit(self) -> None:
         self._refresh_timer.stop()
         self._tick_timer.stop()
-        if self._login_window is not None:
-            self._login_window.close()
+        for window in (self._login_window, self._history_window):
+            if window is not None:
+                window.close()
         self._fetcher.shutdown()
+        self._history.close()
         self._tray.hide()
         # Let Qt delete the web pages before the profile goes away.
         QTimer.singleShot(0, self._qapp.quit)
@@ -109,9 +126,13 @@ class UsageApp(QObject):
     def _build_menu(self) -> QMenu:
         menu = QMenu()
 
-        self._toggle_widget_action = QAction("Show / hide widget", menu)
-        self._toggle_widget_action.triggered.connect(self._toggle_widget)
-        menu.addAction(self._toggle_widget_action)
+        toggle_widget = QAction("Show / hide widget", menu)
+        toggle_widget.triggered.connect(self._toggle_widget)
+        menu.addAction(toggle_widget)
+
+        history_action = QAction("Usage history…", menu)
+        history_action.triggered.connect(self._open_history)
+        menu.addAction(history_action)
 
         refresh_action = QAction("Refresh now", menu)
         refresh_action.triggered.connect(self.refresh)
@@ -130,6 +151,12 @@ class UsageApp(QObject):
         menu.addAction(on_top_action)
 
         if autostart.is_supported():
+            pin_action = QAction("Always show icon on taskbar", menu)
+            pin_action.setCheckable(True)
+            pin_action.setChecked(self._settings.value("pin_tray", True, type=bool))
+            pin_action.toggled.connect(self._set_pin_tray)
+            menu.addAction(pin_action)
+
             autostart_action = QAction("Start with Windows", menu)
             autostart_action.setCheckable(True)
             autostart_action.setChecked(autostart.is_enabled())
@@ -165,6 +192,36 @@ class UsageApp(QObject):
             log.error("Could not change autostart: %s", exc)
             self._tray.showMessage("Claude usage", "Couldn't change the startup setting.")
 
+    def _set_pin_tray(self, pinned: bool) -> None:
+        self._settings.setValue("pin_tray", pinned)
+        try:
+            changed = tray_pin.set_promoted(pinned)
+        except OSError as exc:
+            log.error("Could not change tray pinning: %s", exc)
+            changed = 0
+        if changed:
+            self._reshow_tray()
+        elif pinned and not tray_pin.entry_exists():
+            self._tray.showMessage(
+                "Claude usage",
+                "Couldn't pin the icon automatically. Open Settings > Personalization > "
+                "Taskbar > Other system tray icons and switch this app on.",
+            )
+
+    def _try_pin_tray(self) -> None:
+        if not self._settings.value("pin_tray", True, type=bool):
+            return
+        try:
+            if tray_pin.set_promoted(True):
+                self._reshow_tray()
+        except OSError as exc:
+            log.error("Could not pin tray icon: %s", exc)
+
+    def _reshow_tray(self) -> None:
+        # Re-adding the icon makes Explorer apply the new setting right away.
+        self._tray.hide()
+        QTimer.singleShot(300, self._tray.show)
+
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:  # left click
             self._toggle_widget()
@@ -172,13 +229,38 @@ class UsageApp(QObject):
     # --- fetcher results -------------------------------------------------
 
     def _on_usage(self, limits: list) -> None:
+        now = datetime.now(timezone.utc)
         self._limits = limits
         self._login_prompted = False
-        self._widget.set_limits(limits, datetime.now())
+        try:
+            self._history.add(limits, now)
+        except Exception as exc:  # history is a nice-to-have; never break the widget
+            log.error("Could not save reading: %s", exc)
+        self._forecasts = self._compute_forecasts(limits, now)
+
+        self._widget.set_limits(limits, self._forecasts, datetime.now())
         self._update_tray()
         self._notify_if_needed(limits)
+        if self._history_window is not None and self._history_window.isVisible():
+            self._history_window.reload()
         # Back to the normal interval (a failure shortens it to retry sooner).
         self._refresh_timer.start(self._config.refresh_seconds * 1000)
+
+    def _compute_forecasts(self, limits: list[UsageLimit], now: datetime) -> dict[str, Forecast]:
+        results: dict[str, Forecast] = {}
+        for limit in limits:
+            start = window_start(limit)
+            if start is None:
+                continue
+            try:
+                readings = self._history.readings(limit.key, since=start, until=now)
+            except Exception as exc:
+                log.error("Could not read history: %s", exc)
+                readings = []
+            result = forecast(limit, readings, now)
+            if result is not None:
+                results[limit.key] = result
+        return results
 
     def _on_login_required(self) -> None:
         self._widget.set_status("Sign-in needed — right-click → Sign in again…")
@@ -196,7 +278,15 @@ class UsageApp(QObject):
             self._widget.set_status(f"Couldn't refresh: {message}")
         self._refresh_timer.start(RETRY_AFTER_FAILURE_MS)
 
-    # --- sign-in ---------------------------------------------------------
+    # --- windows ---------------------------------------------------------
+
+    def _open_history(self) -> None:
+        if self._history_window is None:
+            self._history_window = HistoryWindow(self._history)
+            self._history_window.setWindowIcon(render_icon(None, None))
+        self._history_window.show()
+        self._history_window.raise_()
+        self._history_window.activateWindow()
 
     def _open_login(self) -> None:
         if self._login_window is not None:

@@ -1,42 +1,87 @@
-"""The floating desktop panel with one progress bar per limit."""
+"""The floating desktop panel with one bar per limit.
+
+Each bar shows how much of the limit you've used, plus a thin white tick
+showing how much of the window's *time* has passed. If the coloured fill is
+past the tick, you're using the limit faster than time is passing.
+"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from PySide6.QtCore import QPoint, QRectF, QSettings, Qt
+from PySide6.QtCore import QPoint, QRectF, QSettings, QSize, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
-    QProgressBar,
+    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from .forecast import Forecast, describe, pace_text
 from .icons import level_color
 from .models import UsageLimit, format_countdown, format_percent
 
 WIDTH = 290
 PANEL_COLOR = QColor(24, 24, 27, 235)
 BORDER_COLOR = QColor(255, 255, 255, 28)
+TRACK_COLOR = QColor(255, 255, 255, 30)
+TICK_COLOR = QColor(255, 255, 255, 220)
+WARN_TEXT = "#fbbf24"
 
 STYLE = """
 QLabel { color: #e4e4e7; font-family: 'Segoe UI'; }
-QLabel#title { font-size: 13px; font-weight: 600; }
-QLabel#limitName { font-size: 12px; }
-QLabel#limitPercent { font-size: 12px; font-weight: 600; }
-QLabel#reset, QLabel#status { color: #a1a1aa; font-size: 11px; }
-QToolButton { color: #a1a1aa; background: transparent; border: none; font-size: 14px; padding: 0 4px; }
+QLabel#title { font-size: 10pt; font-weight: 600; }
+QLabel#limitName { font-size: 9pt; }
+QLabel#limitPercent { font-size: 9pt; font-weight: 600; }
+QLabel#reset, QLabel#status { color: #a1a1aa; font-size: 8pt; }
+QToolButton { color: #a1a1aa; background: transparent; border: none; font-size: 11pt; padding: 0 4px; }
 QToolButton:hover { color: #ffffff; }
 """
 
-BAR_STYLE = """
-QProgressBar {{ background: rgba(255, 255, 255, 30); border: none; border-radius: 3px; }}
-QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}
-"""
+
+class UsageBar(QWidget):
+    """A thin progress bar with an optional "time elapsed" tick."""
+
+    HEIGHT = 10
+    TRACK_HEIGHT = 6
+
+    def __init__(self, percent: float, color: str, elapsed_percent: Optional[float]):
+        super().__init__()
+        self._percent = percent
+        self._color = QColor(color)
+        self._elapsed = elapsed_percent
+        self.setFixedHeight(self.HEIGHT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def sizeHint(self) -> QSize:
+        return QSize(200, self.HEIGHT)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width = self.width()
+        top = (self.HEIGHT - self.TRACK_HEIGHT) / 2
+        radius = self.TRACK_HEIGHT / 2
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(TRACK_COLOR)
+        painter.drawRoundedRect(QRectF(0, top, width, self.TRACK_HEIGHT), radius, radius)
+
+        fill_width = width * self._percent / 100
+        if fill_width > 0:
+            painter.setBrush(self._color)
+            painter.drawRoundedRect(
+                QRectF(0, top, max(fill_width, self.TRACK_HEIGHT), self.TRACK_HEIGHT), radius, radius
+            )
+
+        if self._elapsed is not None:
+            x = min(max(width * self._elapsed / 100, 1), width - 1)
+            painter.setPen(QPen(TICK_COLOR, 2))
+            painter.drawLine(QPoint(round(x), 0), QPoint(round(x), self.HEIGHT))
 
 
 class DesktopWidget(QWidget):
@@ -45,6 +90,7 @@ class DesktopWidget(QWidget):
         menu: QMenu,
         settings: QSettings,
         on_refresh: Callable[[], None],
+        on_history: Callable[[], None],
         level_of: Callable[[float], str],
     ):
         super().__init__()
@@ -53,6 +99,7 @@ class DesktopWidget(QWidget):
         self._level_of = level_of
         self._drag_offset: Optional[QPoint] = None
         self._limits: list[UsageLimit] = []
+        self._forecasts: dict[str, Forecast] = {}
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(WIDTH)
@@ -61,6 +108,10 @@ class DesktopWidget(QWidget):
 
         title = QLabel("Claude usage")
         title.setObjectName("title")
+        history_button = QToolButton()
+        history_button.setText("📈")
+        history_button.setToolTip("Usage history")
+        history_button.clicked.connect(on_history)
         refresh_button = QToolButton()
         refresh_button.setText("↻")
         refresh_button.setToolTip("Refresh now")
@@ -73,6 +124,7 @@ class DesktopWidget(QWidget):
         header = QHBoxLayout()
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(history_button)
         header.addWidget(refresh_button)
         header.addWidget(hide_button)
 
@@ -94,11 +146,14 @@ class DesktopWidget(QWidget):
 
     # --- public API used by the app --------------------------------------
 
-    def set_limits(self, limits: list[UsageLimit], updated_at: datetime) -> None:
+    def set_limits(
+        self, limits: list[UsageLimit], forecasts: dict[str, Forecast], updated_at: datetime
+    ) -> None:
         self._limits = limits
+        self._forecasts = forecasts
         self._render_rows()
         if limits:
-            self.set_status(f"Updated {updated_at.strftime('%H:%M')}")
+            self.set_status(f"Updated {updated_at.strftime('%H:%M')} · tick = time elapsed")
         else:
             self.set_status("claude.ai reported no limits for this account.")
 
@@ -128,11 +183,12 @@ class DesktopWidget(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
+        now = datetime.now(timezone.utc)
         for limit in self._limits:
-            self._rows.addWidget(self._make_row(limit))
+            self._rows.addWidget(self._make_row(limit, self._forecasts.get(limit.key), now))
         self.adjustSize()
 
-    def _make_row(self, limit: UsageLimit) -> QWidget:
+    def _make_row(self, limit: UsageLimit, forecast: Optional[Forecast], now: datetime) -> QWidget:
         color = level_color(self._level_of(limit.percent))
 
         name = QLabel(limit.label)
@@ -147,25 +203,24 @@ class DesktopWidget(QWidget):
         top.addStretch(1)
         top.addWidget(percent)
 
-        bar = QProgressBar()
-        bar.setRange(0, 1000)
-        bar.setValue(int(limit.percent * 10))
-        bar.setTextVisible(False)
-        bar.setFixedHeight(6)
-        bar.setStyleSheet(BAR_STYLE.format(color=color))
+        bar = UsageBar(limit.percent, color, forecast.elapsed_percent if forecast else None)
+        bar.setToolTip(pace_text(forecast))
 
         row = QWidget()
         column = QVBoxLayout(row)
         column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(4)
+        column.setSpacing(3)
         column.addLayout(top)
         column.addWidget(bar)
 
-        countdown = format_countdown(limit.resets_at)
-        if countdown:
-            reset = QLabel(countdown)
-            reset.setObjectName("reset")
-            column.addWidget(reset)
+        parts = [format_countdown(limit.resets_at, now), describe(forecast, now)]
+        detail_text = " · ".join(part for part in parts if part)
+        if detail_text:
+            detail = QLabel(detail_text)
+            detail.setObjectName("reset")
+            if forecast is not None and forecast.hits_limit_at is not None:
+                detail.setStyleSheet(f"color: {WARN_TEXT};")
+            column.addWidget(detail)
         return row
 
     def paintEvent(self, event) -> None:
